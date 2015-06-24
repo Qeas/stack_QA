@@ -1,0 +1,30 @@
+- hosts: logci
+  connection: smart
+  gather_facts: smart
+  tasks:
+  - name: Nuke it if it exists
+    shell: rm -rf {{ ref_name }}/{{ backend_name }}/*
+    args:
+      chdir: /var/www/static
+
+  - name: Create ref directory on web server
+    shell: mkdir -p /var/www/static/{{ ref_name }}/{{ backend_name }}
+
+  - name: Copy backup of console file
+    copy: src={{ results_dir }}/console.log.out dest=/var/www/static/{{ ref_name }}/{{ backend_name }}/console.log.out
+    ignore_errors: yes
+
+  - name: Copy files to web server
+    copy: src={{ results_dir }}/{{ item }} dest=/var/www/static/{{ ref_name }}/{{ backend_name }}
+    ignore_errors: yes
+    with_items:
+      - ansible.out
+      - stack.sh.log.out
+      - "{{ ref_name }}-{{ backend_name }}.tar.gz"
+
+  - name: Untar log files on web
+    shell: tar -xzf {{ ref_name }}-{{ backend_name }}.tar.gz
+    ignore_errors: yes
+    args:
+      chdir: /var/www/static/{{ ref_name }}/{{ backend_name }}
+

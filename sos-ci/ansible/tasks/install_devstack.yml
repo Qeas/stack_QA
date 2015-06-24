@@ -1,0 +1,47 @@
+- hosts: devstack_instances
+  tasks:
+
+  - name: install pkgs
+    sudo: yes
+    apt: pkg={{ item }} state=present
+    with_items:
+      - git
+      - vim
+      - nfs-common 
+
+  - name: clone devstack
+    sudo: no
+    git: repo=https://github.com/openstack-dev/devstack dest=~/devstack
+
+  - name: send over local.conf
+    sudo: no
+    template: src=../../templates/localconf.{{backend_name}} dest=/home/ubuntu/devstack/local.conf
+
+  - name: modify cinder_branch
+    lineinfile: dest=/home/ubuntu/devstack/local.conf regexp=^CINDER_BRANCH= line=CINDER_BRANCH={{ patchset_ref }}
+    register: git_sha
+  
+  - name: send nexenta_shares config
+    sudo: yes
+    template: src=../../templates/shares.cfg dest=/home/ubuntu/shares.cfg
+
+  - name: send nexenta5_shares config
+    sudo: yes
+    template: src=../../templates/shares_ns5.cfg dest=/home/ubuntu/shares_ns5.cfg
+    
+  - name: send nexenta_driver hook
+    sudo: no
+    template: src=../../scripts/nexenta_driver.sh dest=/home/ubuntu/devstack/extras.d/10-nexenta_driver.sh
+
+  - name: run stack.sh
+    sudo: no
+    shell: cd /home/ubuntu/devstack; ./stack.sh 2>&1 > /tmp/stack.sh.log.out
+    register: stack_result
+    ignore_errors: true
+
+  - name: Fetch stack.sh.log.out
+    fetch: src=/tmp/stack.sh.log.out dest={{ results_dir }}/stack.sh.log.out flat=yes validate_md5=no
+
+  - name: Fail the stack.sh task
+    fail: msg="Failed to complete stack.sh"
+    when: stack_result|failed

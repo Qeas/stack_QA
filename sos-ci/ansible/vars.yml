@@ -1,0 +1,8 @@
+os_login: admin
+os_password: admin
+os_tenant_name: admin
+auth_url: http://172.16.0.3:5000/v2.0
+image_id: 94b57908-6bdd-49f2-b112-857c24792c02
+flavor_id: 101
+key_name: cloud
+multinic: false

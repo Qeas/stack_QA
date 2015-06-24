@@ -1,0 +1,53 @@
+[[local|localrc]]
+HOST_IP=127.0.0.1
+ACTIVE_TIMEOUT=390
+BOOT_TIMEOUT=390
+ASSOCIATE_TIMEOUT=360
+TERMINATE_TIMEOUT=360
+MYSQL_PASSWORD=0
+DATABASE_PASSWORD=0
+RABBIT_PASSWORD=0
+ADMIN_PASSWORD=0
+SERVICE_PASSWORD=0
+SERVICE_TOKEN=111222333444
+
+ENABLED_SERVICES=c-api,c-sch,c-vol,cinder,dstat,g-api,g-reg,horizon,key,mysql,n-api,n-cond,n-cpu,n-crt,n-net,n-obj,n-sch,rabbit,tempest
+
+LIBS_FROM_GIT=python-keystoneclient,python-keystonemiddleware
+# Screen console logs will capture service logs.
+SYSLOG=False
+SCREEN_LOGDIR=/opt/stack/screen-logs
+LOGFILE=/opt/stack/devstacklog.txt
+VERBOSE=True
+FIXED_RANGE=10.1.0.0/20
+FIXED_NETWORK_SIZE=4096
+VIRT_DRIVER=libvirt
+LOG_COLOR=False
+CINDER_PERIODIC_INTERVAL=10
+CINDER_SECURE_DELETE=False
+API_RATE_LIMIT=False
+#TEMPEST_HTTP_IMAGE=http://127.0.0.1/
+USE_SCREEN=True
+
+# Settings to enable use of Driver
+CINDER_ENABLED_BACKENDS=ns5_iscsi
+TEMPEST_VOLUME_DRIVER=cinder.volume.drivers.nexenta.ns5.iscsi.NexentaISCSIDriver
+TEMPEST_VOLUME_VENDOR="Nexenta"
+TEMPEST_STORAGE_PROTOCOL=iSCSI
+
+# Disable security groups entirely
+Q_USE_SECGROUP=False
+LIBVIRT_FIREWALL_DRIVER=nova.virt.firewall.NoopFirewallDriver
+CINDER_SECURE_DELETE=False
+CINDER_BRANCH=master
+
+[[post-config|$CINDER_CONF]]
+[ns5_iscsi]
+volume_driver = cinder.volume.drivers.nexenta.ns5.iscsi.NexentaISCSIDriver
+volume_backend_name = ns5_iscsi
+nexenta_host = 10.3.199.28
+nexenta_rest_port = 8080
+nexenta_user = root
+nexenta_password = ''
+nexenta_volume = ci/iscsi
+nexenta_capacitycheck = 100

@@ -1,0 +1,328 @@
+#!/usr/bin/python
+
+from email.mime.text import MIMEText
+from collections import deque
+import json
+from optparse import OptionParser
+import os
+import paramiko
+import shutil
+import subprocess
+import sys
+from threading import Thread
+import time
+
+from iniparse import INIConfig
+
+import executor
+import log
+
+fdir = os.path.dirname(os.path.realpath(__file__))
+conf_dir = os.path.dirname(fdir)
+cfg = INIConfig(open(conf_dir + '/sos-ci.conf'))
+
+# Misc settings
+DATA_DIR =\
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))) + '/data'
+if cfg.Data.data_dir:
+    DATA_DIR = cfg.Data.data_dir
+
+logger = log.setup_logger(DATA_DIR + '/os-ci.log')
+event_queue = deque()
+pipeline = deque()
+
+
+class InstanceBuildException(Exception):
+    def __init__(self, message):
+        Exception.__init__(self, message)
+
+
+def _is_my_ci_recheck(event):
+    if (event.get('type', 'nill') == 'comment-added' and
+            cfg.AccountInfo.recheck_string in event['comment'].lower() and
+            cfg.AccountInfo.project_name == event['change']['project'] and
+            event['change']['branch'] == 'master'):
+        logger.info('Detected recheck request for event: %s', event)
+        return True
+    return False
+
+
+def _is_my_ci_master(event):
+    if (event.get('type', 'nill') == 'comment-added' and
+            'Verified+1' in event['comment'] and
+            cfg.AccountInfo.project_name == event['change']['project']):
+        if event['author']['username'] == 'jenkins':
+            if event['change']['branch'] != 'master':
+                logger.info('Not testing changes outside of master '
+                            'yet (branch=%s).',
+                            event['change']['branch'])
+            else:
+                logger.info('Detected valid event: %s', event)
+                return True
+    return False
+
+
+def _filter_cinder_events(event):
+    if _is_my_ci_recheck(event) or _is_my_ci_master(event):
+        logger.info('Adding review id %s to job queue...' %
+                    event['change']['number'])
+
+        # One log to act as a data store, and another just to look at
+        with open(DATA_DIR + '/valid-event.log', 'a') as f:
+            json.dump(event, f)
+            f.write('\n')
+        with open(DATA_DIR + '/pretty-event.log', 'a') as f:
+            json.dump(event, f, indent=2)
+        return event
+    else:
+        return None
+
+
+def _send_notification_email(subject, msg):
+    if cfg.Email.enable_notifications:
+        msg = MIMEText(msg)
+        msg["From"] = cfg.Email.from_address
+        msg["To"] = cfg.Email.to_address
+        msg["Subject"] = subject
+        p = subprocess.Popen(["/usr/sbin/sendmail", "-t"],
+                             stdin=subprocess.PIPE)
+        p.communicate(msg.as_string())
+
+
+class JobThread(Thread):
+    """ Thread to process the gerrit events. """
+
+    def _post_results_to_gerrit(self, log_location, results, commit_id):
+        logger.debug("Post results to gerrit using %(location)s\n "
+                     "commit_id: %(commit_id)s\n",
+                     {'location': log_location,
+                      'commit_id': commit_id})
+
+        cmd = 'gerrit review -m "'
+        subject = ''
+        msg = ''
+        logger.debug('Building gerrit review message...')
+        msg = 'Commit: %s\nLogs: %s\n' % (commit_id, log_location)
+        failed = False
+        for backend_name in results:
+            result = results[backend_name]
+            m, s = divmod(result['elapsed'], 60)
+            elapsed_str = '%sm %ss' % (m, s)
+            ci_name = cfg.AccountInfo.ci_name + '-' + backend_name
+            if result['success']:
+                subject += " %s SUCCESS" % ci_name
+                msg += "Result: SUCCESS\n"
+                cmd += '* %s %s/%s : SUCCESS in %s\n' % \
+                       (ci_name, log_location, backend_name, elapsed_str)
+                logger.debug("Created success cmd: %s", cmd)
+            else:
+                failed = True
+                subject += " %s FAILED" % ci_name
+                msg += "Result: FAILED\n"
+                cmd += '* %s %s/%s : FAILURE in %s\n' % \
+                       (ci_name, log_location, backend_name, elapsed_str)
+                logger.debug("Created failed cmd: %s", cmd)
+
+        cmd += '" %s' % commit_id
+
+        logger.debug('Issue notification email, '
+                     'Subject: %(subject)s, %(msg)s',
+                     {'subject': subject, 'msg': msg})
+
+        _send_notification_email(subject, msg)
+
+        #if not failed:
+        logger.debug('Connecting to gerrit for voting '
+                     '%(user)s@%(host)s:%(port)d '
+                     'using keyfile %(key_file)s',
+                     {'user': cfg.AccountInfo.ci_account,
+                      'host': cfg.AccountInfo.gerrit_host,
+                      'port': int(cfg.AccountInfo.gerrit_port),
+                      'key_file': cfg.AccountInfo.gerrit_ssh_key})
+
+        self.ssh = paramiko.SSHClient()
+        self.ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        try:
+            self.ssh.connect(cfg.AccountInfo.gerrit_host,
+                             int(cfg.AccountInfo.gerrit_port),
+                             cfg.AccountInfo.ci_account,
+                             key_filename=cfg.AccountInfo.gerrit_ssh_key)
+            logger.info('Issue vote: %s', cmd)
+            self.stdin, self.stdout, self.stderr =\
+                self.ssh.exec_command(cmd)
+        except paramiko.SSHException as e:
+            logger.error('%s', e)
+            #sys.exit(1)
+
+    def _run_subunit2sql(self, results_dir, ref_name):
+        if not cfg.DataBase.enable_subunit2sql:
+            logger.info('DataBase.enable_subunit2sql is not enabled, '
+                        'skipping data base operations')
+            return
+
+        subunit_file = results_dir + '/' + ref_name + '/testrepository.subunit'
+        cmd = 'subunit2sql --database-connection %s %s'% (cfg.DataBase.database_connection_string, subunit_file)
+        subunit2sql_proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE)
+        output = subunit2sql_proc.communicate()[0]
+        logger.debug('Response from subunit2sql: %s', output)
+        return
+
+    def run(self):
+        counter = 60
+        while True:
+            counter -= 1
+            event_queue
+            if not event_queue:
+                if counter <= 1:
+                    logger.debug('Queue is empty, '
+                                 'checking every 60 seconds...')
+                    counter = 60
+                time.sleep(60)
+            else:
+                event = event_queue.popleft()
+                logger.debug("Processing event from queue:\n%s", event)
+
+                # Add a goofy pipeline queue so we know
+                # not only when nothing is in the queue
+                # but when nothings outstanding so we can
+                # run cleanup on the backend device
+                pipeline.append(valid_event)
+
+                
+                patchset_ref = event['patchSet']['ref']
+                revision = event['patchSet']['revision']
+                logger.debug('Grabbed revision from event: %s', revision)
+
+                ref_name = patchset_ref.replace('/', '-')
+                
+                results_dir = DATA_DIR + '/' + ref_name
+                # This might be a recheck, if so we've presumably
+                # run things once and published, so delete the
+                # local copy and run it again
+                if os.path.isdir(results_dir):
+                    shutil.rmtree(results_dir)
+                os.mkdir(results_dir)
+
+                # Launch instance, run tempest etc etc etc for every backend
+                enabled_backends = cfg.AccountInfo.enabled_backends.split(',')
+                results = {}
+                for backend_name in enabled_backends:
+                    res_dir = results_dir + '/' + backend_name
+                    os.mkdir(res_dir)
+
+                    num_retries = int(cfg.AccountInfo.num_retries)
+                    for t in xrange(num_retries):
+                        start = time.time()
+                        try:
+                            commit_id, success, output = \
+                                executor.just_doit(event['patchSet']['ref'],
+                                                   res_dir, backend_name)
+                            logger.info('Completed just_doit: %(commit)s, '
+                                        '%(success)s, %(output)s',
+                                        {'commit': commit_id,
+                                         'success': success,
+                                         'output': output})
+
+                        except InstanceBuildException:
+                            logger.error('Received InstanceBuildException...')
+                            pass
+                        elapsed = int(time.time() - start)
+                        if success:
+                            break
+
+                    if commit_id is None:
+                        commit_id = revision
+
+                    logger.info("Completed %s", cfg.AccountInfo.ci_name + '-' + backend_name)
+                    results[backend_name] = dict(success = success,
+                        output = output, elapsed = elapsed)
+
+                url_name = patchset_ref.replace('/', '-')
+                log_location = 'http://140.174.232.106/' + url_name
+                self._post_results_to_gerrit(log_location, results, commit_id)
+                #self._run_subunit2sql(res_dir, ref_name)
+
+                try:
+                    pipeline.remove(valid_event)
+                except ValueError:
+                    pass
+
+
+class GerritEventStream(object):
+    def __init__(self, *args, **kwargs):
+
+        logger.debug('Connecting to gerrit stream with '
+                     '%(user)s@%(host)s:%(port)d '
+                     'using keyfile %(key_file)s',
+                     {'user': cfg.AccountInfo.ci_account,
+                      'host': cfg.AccountInfo.gerrit_host,
+                      'port': int(cfg.AccountInfo.gerrit_port),
+                      'key_file': cfg.AccountInfo.gerrit_ssh_key})
+
+        self.ssh = paramiko.SSHClient()
+        self.ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+
+        connected = False
+        while not connected:
+            try:
+                self.ssh.connect(cfg.AccountInfo.gerrit_host,
+                                 int(cfg.AccountInfo.gerrit_port),
+                                 cfg.AccountInfo.ci_account,
+                                 key_filename=cfg.AccountInfo.gerrit_ssh_key)
+                connected = True
+            except paramiko.SSHException as e:
+                logger.error('%s', e)
+                logger.warn('Gerrit may be down, will pause and retry...')
+                time.sleep(10)
+
+        self.stdin, self.stdout, self.stderr =\
+            self.ssh.exec_command("gerrit stream-events")
+
+    def __iter__(self):
+        return self
+
+    def next(self):
+        return self.stdout.readline()
+
+
+def process_options():
+    usage = "usage: %prog [options]\nos_ci.py."
+    parser = OptionParser(usage, version='%prog 0.1')
+
+    parser.add_option('-n', '--num-threads', action='store',
+                      type='int',
+                      default=3,
+                      dest='number_of_worker_threads',
+                      help='Number of job threads to run (default = 3).')
+    parser.add_option('-m', action='store_true',
+                      dest='event_monitor_only',
+                      help='Just monitor Gerrit stream, dont process events.')
+    (options, args) = parser.parse_args()
+    return options
+
+
+if __name__ == '__main__':
+    event_queue = deque()
+    options = process_options()
+
+    for i in xrange(options.number_of_worker_threads):
+        JobThread().start()
+
+    while True:
+        events = GerritEventStream('nsci')
+        for event in events:
+            try:
+                event = json.loads(event)
+            except Exception as ex:
+                logger.error('Failed json.loads on event: %s', event)
+                logger.exception(ex)
+                break
+            with open(DATA_DIR + '/received-events.log', 'a') as f:
+                json.dump(event, f)
+                f.write('\n')
+            valid_event = _filter_cinder_events(event)
+            if valid_event:
+                logger.debug('Identified valid event, sending to queue...')
+                if not options.event_monitor_only:
+                    logger.debug("Adding event to queue:%s\n", valid_event)
+                    event_queue.append(valid_event)

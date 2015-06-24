@@ -1,0 +1,14 @@
+- hosts: devstack_instances
+  tasks:
+
+  - name: install pkgs
+    sudo: yes
+    apt: pkg={{ item }} state=present
+    with_items:
+      - git
+      - vim
+      - nfs-common 
+
+  - name: clone devstack
+    sudo: no
+    git: repo=https://github.com/openstack-dev/devstack dest=~/devstack
